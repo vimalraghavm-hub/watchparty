@@ -1,15 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Loader2, MessageSquare, CloudUpload } from 'lucide-react';
+import { Loader2, MessageSquare, Copy, Check, Users } from 'lucide-react';
 import { useWatchRoom } from '../hooks/useWatchRoom';
 import { WebRTCManager } from '../lib/webrtc';
 import { Navbar } from '../components/Navbar';
 import { VideoPlayer } from '../components/VideoPlayer';
 import { MovieSelector } from '../components/MovieSelector';
-import { MovieUploader } from '../components/MovieUploader';
 import { RemoteVideoTile } from '../components/RemoteVideoTile';
 import { ChatPanel } from '../components/ChatPanel';
-import { WaitingRoom } from '../components/WaitingRoom';
 import { ExpiredRoomPage } from './ExpiredRoomPage';
 import { Modal } from '../components/Modal';
 import type { CallStatus, MediaDeviceState } from '../types';
@@ -29,8 +27,11 @@ export const WatchRoomPage: React.FC = () => {
     syncStatus,
     setSyncStatus,
     chatMessages,
-    roomMedia,
     localObjectUrl,
+    isHashingLocalFile,
+    hashProgress,
+    matchStatus,
+    isMatched,
     setLocalMovie,
     sendSyncCommand,
     sendWebRTCSignal,
@@ -54,9 +55,9 @@ export const WatchRoomPage: React.FC = () => {
 
   // UI state
   const [isChatOpen, setIsChatOpen] = useState<boolean>(true);
-  const [showCloudUploader, setShowCloudUploader] = useState<boolean>(false);
   const [showLeaveModal, setShowLeaveModal] = useState<boolean>(false);
   const [showRevokeModal, setShowRevokeModal] = useState<boolean>(false);
+  const [copiedInvite, setCopiedInvite] = useState<boolean>(false);
 
   // Remove raw token from visible URL after validation for security
   useEffect(() => {
@@ -120,6 +121,14 @@ export const WatchRoomPage: React.FC = () => {
     }
   };
 
+  const handleCopyInvite = () => {
+    if (!room?.invitation_token) return;
+    const url = `${window.location.origin}/join/${room.invitation_token}`;
+    navigator.clipboard.writeText(url);
+    setCopiedInvite(true);
+    setTimeout(() => setCopiedInvite(false), 2500);
+  };
+
   // Cleanup WebRTC call on unmount
   useEffect(() => {
     return () => {
@@ -144,42 +153,6 @@ export const WatchRoomPage: React.FC = () => {
 
   const peer = participants.find((p) => p.id !== currentUser?.id);
 
-  // If second participant has not joined yet, show WaitingRoom
-  if (!peer && isHost) {
-    return (
-      <div className="h-full flex flex-col bg-slate-950 text-slate-100">
-        <Navbar
-          roomTitle={room.title}
-          invitationToken={room.invitation_token}
-          participants={participants}
-          currentUserId={currentUser?.id}
-          isHost={isHost}
-          isOnline={true}
-          onLeaveRoom={() => navigate('/')}
-          onRevokeRoom={() => setShowRevokeModal(true)}
-        />
-        <WaitingRoom
-          roomTitle={room.title}
-          invitationToken={room.invitation_token}
-          isHost={isHost}
-          onRevokeRoom={() => setShowRevokeModal(true)}
-        />
-        <Modal
-          isOpen={showRevokeModal}
-          title="Revoke & Close Room"
-          message="Are you sure you want to end this watch party and revoke the invitation link?"
-          isDestructive={true}
-          confirmText="End Party"
-          onConfirm={async () => {
-            await revokeRoom();
-            navigate('/');
-          }}
-          onCancel={() => setShowRevokeModal(false)}
-        />
-      </div>
-    );
-  }
-
   return (
     <div className="h-full flex flex-col bg-slate-950 text-slate-100 overflow-hidden">
       {/* Sleek Top Navbar */}
@@ -197,27 +170,65 @@ export const WatchRoomPage: React.FC = () => {
       {/* Main Watch Layout */}
       <div className="flex-1 flex overflow-hidden relative">
         {/* Primary Video Player Column */}
-        <main className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-5">
+        <main className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4">
+          {/* Waiting for Partner Banner (Host only when peer not yet joined) */}
+          {!peer && isHost && (
+            <div className="bg-gradient-to-r from-slate-900 via-violet-950/40 to-slate-900 border border-violet-800/40 rounded-2xl p-4 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs shadow-lg">
+              <div className="flex items-center space-x-3">
+                <div className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
+                <div>
+                  <span className="font-semibold text-slate-100 text-sm">
+                    Waiting for partner to join (1/2 connected)
+                  </span>
+                  <p className="text-slate-400 text-xs">
+                    You can pick your local movie file right now. Playback will synchronize once your partner joins and picks the matching file.
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleCopyInvite}
+                className="flex items-center space-x-1.5 bg-rose-600 hover:bg-rose-500 text-white px-3.5 py-2 rounded-xl font-semibold shadow transition cursor-pointer shrink-0"
+              >
+                {copiedInvite ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                <span>{copiedInvite ? 'Link Copied!' : 'Copy Invite Link'}</span>
+              </button>
+            </div>
+          )}
+
           {/* Main Video Player */}
           <VideoPlayer
             src={localObjectUrl}
             playbackState={playbackState}
             syncStatus={syncStatus}
+            matchStatus={matchStatus}
+            isMatched={isMatched}
             onSendSyncCommand={sendSyncCommand}
             onSyncStatusChange={setSyncStatus}
+            onOpenPicker={() => {
+              const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+              if (fileInput) {
+                fileInput.value = '';
+                fileInput.click();
+              }
+            }}
           />
 
-          {/* Local Movie File Picker / Match Status */}
+          {/* Local Movie File Picker & Match Status */}
           <MovieSelector
             participants={participants}
             currentUserId={currentUser?.id || ''}
+            matchStatus={matchStatus}
+            isHashing={isHashingLocalFile}
+            hashProgress={hashProgress}
             onSelectLocalMovie={setLocalMovie}
-            onShowUploader={() => setShowCloudUploader(true)}
           />
 
           {/* Quick Action Bar for Tablet & Mobile */}
           <div className="flex items-center justify-between lg:hidden pt-2">
             <button
+              type="button"
               onClick={() => setIsChatOpen(!isChatOpen)}
               className="flex items-center space-x-2 bg-slate-900 border border-slate-800 text-slate-200 px-4 py-2 rounded-xl text-xs font-semibold"
             >
@@ -225,17 +236,14 @@ export const WatchRoomPage: React.FC = () => {
               <span>Toggle Chat ({chatMessages.length})</span>
             </button>
 
-            <button
-              onClick={() => setShowCloudUploader(true)}
-              className="flex items-center space-x-2 bg-slate-900 border border-slate-800 text-slate-200 px-4 py-2 rounded-xl text-xs font-semibold"
-            >
-              <CloudUpload className="w-4 h-4 text-rose-400" />
-              <span>Private Storage</span>
-            </button>
+            <span className="text-xs text-slate-400 flex items-center gap-1.5">
+              <Users className="w-3.5 h-3.5 text-violet-400" />
+              <span>{participants.filter((p) => p.isOnline).length}/2 Connected</span>
+            </span>
           </div>
         </main>
 
-        {/* Floating WebRTC Video Call Tile */}
+        {/* Floating Draggable WebRTC Video Call Tile */}
         <RemoteVideoTile
           localStream={localStream}
           remoteStream={remoteStream}
@@ -258,19 +266,6 @@ export const WatchRoomPage: React.FC = () => {
           onToggleOpen={() => setIsChatOpen(false)}
         />
       </div>
-
-      {/* Cloud Uploader / Downloader Modal */}
-      {showCloudUploader && (
-        <MovieUploader
-          roomId={room.id}
-          isHost={isHost}
-          roomMedia={roomMedia}
-          onClose={() => setShowCloudUploader(false)}
-          onDownloadCompleted={(file, hash) => {
-            setLocalMovie(file, hash);
-          }}
-        />
-      )}
 
       {/* Modals for Leave / Revoke */}
       <Modal

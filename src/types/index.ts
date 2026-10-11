@@ -91,6 +91,12 @@ export interface PlaybackCommandPayload {
 
 export type SyncStatus = 'synced' | 'correcting' | 'buffering' | 'reconnecting' | 'desynced' | 'waiting_for_file';
 
+export type MovieMatchStatus =
+  | 'waiting_for_movie'
+  | 'checking_movie'
+  | 'movies_match'
+  | 'movies_mismatch';
+
 export interface ChatMessage {
   id: string;
   room_id: string;

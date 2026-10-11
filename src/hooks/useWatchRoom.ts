@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase, isSupabaseConfigured, localHub, validateInvitationToken } from '../lib/supabase';
-import { getOrCreateGuestId, getOrCreateGuestName } from '../lib/security';
+import { getOrCreateGuestId, getOrCreateGuestName, calculateFileHash } from '../lib/security';
 import { applyCommandToState, isCommandValidAndNew } from '../lib/syncEngine';
 import type {
   Room,
@@ -10,6 +10,7 @@ import type {
   ChatMessage,
   WebRTCSignalingMessage,
   SyncStatus,
+  MovieMatchStatus,
   RoomMedia,
 } from '../types';
 
@@ -39,6 +40,13 @@ export function useWatchRoom(invitationOrRoomToken?: string) {
   const [localFile, setLocalFile] = useState<File | null>(null);
   const [localObjectUrl, setLocalObjectUrl] = useState<string | null>(null);
   const [localFileHash, setLocalFileHash] = useState<string | null>(null);
+  const [isHashingLocalFile, setIsHashingLocalFile] = useState<boolean>(false);
+  const [hashProgress, setHashProgress] = useState<number>(0);
+
+  // Store the active object URL in a ref to control cleanup strictly on replace or unmount
+  const objectUrlRef = useRef<string | null>(null);
+  const localFileHashRef = useRef<string | null>(null);
+  const localFileRef = useRef<File | null>(null);
 
   // WebRTC signaling handler reference
   const onWebRTCSignalRef = useRef<((msg: WebRTCSignalingMessage) => void) | null>(null);
@@ -229,14 +237,51 @@ export function useWatchRoom(invitationOrRoomToken?: string) {
           setRoomMedia(payload as RoomMedia);
         })
         .on('broadcast', { event: 'participant-ready' }, ({ payload }) => {
-          const { participantId, fileHash, fileName } = payload as { participantId: string; fileHash: string; fileName: string };
-          setParticipants((prev) =>
-            prev.map((p) =>
-              p.id === participantId
-                ? { ...p, isMediaReady: true, localFileHash: fileHash, localFileName: fileName }
-                : p
-            )
-          );
+          const { participantId, fileHash, fileName, fileSize } = payload as {
+            participantId: string;
+            fileHash: string;
+            fileName: string;
+            fileSize?: number;
+          };
+          setParticipants((prev) => {
+            const exists = prev.some((p) => p.id === participantId);
+            if (exists) {
+              return prev.map((p) =>
+                p.id === participantId
+                  ? { ...p, isMediaReady: true, localFileHash: fileHash, localFileName: fileName, localFileSize: fileSize }
+                  : p
+              );
+            }
+            return [
+              ...prev,
+              {
+                id: participantId,
+                name: 'Peer',
+                role: 'guest',
+                joinedAt: new Date().toISOString(),
+                isOnline: true,
+                isMediaReady: true,
+                localFileHash: fileHash,
+                localFileName: fileName,
+                localFileSize: fileSize,
+              },
+            ];
+          });
+        })
+        .on('broadcast', { event: 'request-peer-status' }, () => {
+          // If we already have a selected movie and hash, respond with our status
+          if (localFileHashRef.current && localFileRef.current) {
+            channel.send({
+              type: 'broadcast',
+              event: 'participant-ready',
+              payload: {
+                participantId: userId,
+                fileHash: localFileHashRef.current,
+                fileName: localFileRef.current.name,
+                fileSize: localFileRef.current.size,
+              },
+            });
+          }
         })
         .on('presence', { event: 'sync' }, () => {
           const state = channel.presenceState();
@@ -254,6 +299,12 @@ export function useWatchRoom(invitationOrRoomToken?: string) {
               userId,
               userName,
               onlineAt: new Date().toISOString(),
+            });
+            // Request peer status upon joining
+            channel.send({
+              type: 'broadcast',
+              event: 'request-peer-status',
+              payload: { participantId: userId },
             });
           }
         });
@@ -283,16 +334,50 @@ export function useWatchRoom(invitationOrRoomToken?: string) {
         } else if (event === 'media-updated') {
           setRoomMedia(payload as RoomMedia);
         } else if (event === 'participant-ready') {
-          const { participantId, fileHash, fileName } = payload as { participantId: string; fileHash: string; fileName: string };
-          setParticipants((prev) =>
-            prev.map((p) =>
-              p.id === participantId
-                ? { ...p, isMediaReady: true, localFileHash: fileHash, localFileName: fileName }
-                : p
-            )
-          );
+          const { participantId, fileHash, fileName, fileSize } = payload as {
+            participantId: string;
+            fileHash: string;
+            fileName: string;
+            fileSize?: number;
+          };
+          setParticipants((prev) => {
+            const exists = prev.some((p) => p.id === participantId);
+            if (exists) {
+              return prev.map((p) =>
+                p.id === participantId
+                  ? { ...p, isMediaReady: true, localFileHash: fileHash, localFileName: fileName, localFileSize: fileSize }
+                  : p
+              );
+            }
+            return [
+              ...prev,
+              {
+                id: participantId,
+                name: 'Peer',
+                role: 'guest',
+                joinedAt: new Date().toISOString(),
+                isOnline: true,
+                isMediaReady: true,
+                localFileHash: fileHash,
+                localFileName: fileName,
+                localFileSize: fileSize,
+              },
+            ];
+          });
+        } else if (event === 'request-peer-status') {
+          if (localFileHashRef.current && localFileRef.current) {
+            localHub.broadcast(channelName, 'participant-ready', {
+              participantId: userId,
+              fileHash: localFileHashRef.current,
+              fileName: localFileRef.current.name,
+              fileSize: localFileRef.current.size,
+            });
+          }
         }
       });
+
+      // Request peer status in mock mode
+      localHub.broadcast(channelName, 'request-peer-status', { participantId: userId });
 
       return () => {
         unsubscribe();
@@ -398,50 +483,84 @@ export function useWatchRoom(invitationOrRoomToken?: string) {
     [room, userId, userName, isHost]
   );
 
-  // Set local movie & calculate hash
+  // Set local movie: creates object URL immediately and hashes in background
   const setLocalMovie = useCallback(
-    async (file: File, fileHash: string) => {
-      if (localObjectUrl) {
-        URL.revokeObjectURL(localObjectUrl);
+    async (file: File) => {
+      // 1. Revoke previous object URL if replacing file
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
       }
 
-      const objUrl = URL.createObjectURL(file);
-      setLocalFile(file);
-      setLocalObjectUrl(objUrl);
-      setLocalFileHash(fileHash);
+      // 2. Create new object URL and load file immediately
+      const newUrl = URL.createObjectURL(file);
+      objectUrlRef.current = newUrl;
+      localFileRef.current = file;
 
+      setLocalFile(file);
+      setLocalObjectUrl(newUrl);
+      setLocalFileHash(null);
+      localFileHashRef.current = null;
+      setIsHashingLocalFile(true);
+      setHashProgress(0);
+
+      // Optimistically update self participant status
       setParticipants((prev) =>
         prev.map((p) =>
           p.id === userId
-            ? { ...p, isMediaReady: true, localFileHash: fileHash, localFileName: file.name }
+            ? { ...p, isMediaReady: false, localFileName: file.name, localFileSize: file.size, localFileHash: undefined }
             : p
         )
       );
 
-      if (room) {
-        const payload = {
-          participantId: userId,
-          fileHash,
-          fileName: file.name,
-        };
+      // 3. Incrementally calculate SHA-256 hash in background
+      try {
+        const computedHash = await calculateFileHash(file, (p) => {
+          setHashProgress(p);
+        });
 
-        if (supabase && isSupabaseConfigured) {
-          await supabase.from('room_members').update({
-            local_file_hash: fileHash,
-            local_file_name: file.name,
-          }).eq('room_id', room.id).eq('user_id', userId);
+        localFileHashRef.current = computedHash;
+        setLocalFileHash(computedHash);
+        setIsHashingLocalFile(false);
+        setHashProgress(100);
 
-          await supabase.channel(`room_${room.id}`).send({
-            type: 'broadcast',
-            event: 'participant-ready',
-            payload,
-          });
-        } else {
-          localHub.broadcast(`room_${room.id}`, 'participant-ready', payload);
+        setParticipants((prev) =>
+          prev.map((p) =>
+            p.id === userId
+              ? { ...p, isMediaReady: true, localFileHash: computedHash, localFileName: file.name, localFileSize: file.size }
+              : p
+          )
+        );
+
+        // Broadcast to peer that local file hash is verified
+        if (room) {
+          const payload = {
+            participantId: userId,
+            fileHash: computedHash,
+            fileName: file.name,
+            fileSize: file.size,
+          };
+
+          if (supabase && isSupabaseConfigured) {
+            await supabase.from('room_members').update({
+              local_file_hash: computedHash,
+              local_file_name: file.name,
+            }).eq('room_id', room.id).eq('user_id', userId);
+
+            await supabase.channel(`room_${room.id}`).send({
+              type: 'broadcast',
+              event: 'participant-ready',
+              payload,
+            });
+          } else {
+            localHub.broadcast(`room_${room.id}`, 'participant-ready', payload);
+          }
         }
+      } catch (err) {
+        console.error('File hash calculation failed:', err);
+        setIsHashingLocalFile(false);
       }
     },
-    [localObjectUrl, room, userId]
+    [room, userId]
   );
 
   // Revoke room invitation / Close room (host only)
@@ -455,14 +574,34 @@ export function useWatchRoom(invitationOrRoomToken?: string) {
     setRoom((prev) => (prev ? { ...prev, is_active: false } : null));
   }, [room, isHost]);
 
-  // Clean up object URL on unmount
+  // Clean up object URL strictly on component unmount
   useEffect(() => {
     return () => {
-      if (localObjectUrl) {
-        URL.revokeObjectURL(localObjectUrl);
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
       }
     };
-  }, [localObjectUrl]);
+  }, []);
+
+  // Compute derived Movie Match Status
+  const selfParticipant = participants.find((p) => p.id === userId);
+  const peerParticipant = participants.find((p) => p.id !== userId);
+
+  let matchStatus: MovieMatchStatus = 'waiting_for_movie';
+  if (isHashingLocalFile) {
+    matchStatus = 'checking_movie';
+  } else if (!selfParticipant?.isMediaReady || !peerParticipant?.isMediaReady) {
+    matchStatus = 'waiting_for_movie';
+  } else if (selfParticipant.localFileHash && peerParticipant.localFileHash) {
+    if (selfParticipant.localFileHash === peerParticipant.localFileHash) {
+      matchStatus = 'movies_match';
+    } else {
+      matchStatus = 'movies_mismatch';
+    }
+  }
+
+  const isMatched = matchStatus === 'movies_match';
 
   return {
     room,
@@ -479,6 +618,10 @@ export function useWatchRoom(invitationOrRoomToken?: string) {
     localFile,
     localObjectUrl,
     localFileHash,
+    isHashingLocalFile,
+    hashProgress,
+    matchStatus,
+    isMatched,
     setLocalMovie,
     sendSyncCommand,
     sendWebRTCSignal,

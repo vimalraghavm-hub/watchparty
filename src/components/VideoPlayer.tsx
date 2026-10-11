@@ -1,22 +1,49 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { Play, Pause, Volume2, VolumeX, Maximize, RotateCcw, AlertTriangle, CheckCircle2, RefreshCw } from 'lucide-react';
-import { calculateTargetPosition, calculateDrift, shouldHardSeek, calculateRateCorrection, getEstimatedServerTime } from '../lib/syncEngine';
-import type { PlaybackState, SyncStatus } from '../types';
+import {
+  Play,
+  Pause,
+  Volume2,
+  VolumeX,
+  Maximize,
+  RotateCcw,
+  AlertTriangle,
+  CheckCircle2,
+  RefreshCw,
+  Film,
+} from 'lucide-react';
+import {
+  calculateTargetPosition,
+  calculateDrift,
+  shouldHardSeek,
+  calculateRateCorrection,
+  getEstimatedServerTime,
+} from '../lib/syncEngine';
+import type { PlaybackState, SyncStatus, MovieMatchStatus } from '../types';
 
 interface VideoPlayerProps {
   src: string | null;
   playbackState: PlaybackState;
   syncStatus: SyncStatus;
-  onSendSyncCommand: (type: 'PLAY' | 'PAUSE' | 'SEEK' | 'PLAYBACK_RATE_CHANGE', targetPos: number, rate?: number) => void;
+  matchStatus: MovieMatchStatus;
+  isMatched: boolean;
+  onSendSyncCommand: (
+    type: 'PLAY' | 'PAUSE' | 'SEEK' | 'PLAYBACK_RATE_CHANGE',
+    targetPos: number,
+    rate?: number
+  ) => void;
   onSyncStatusChange: (status: SyncStatus) => void;
+  onOpenPicker?: () => void;
 }
 
 export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   src,
   playbackState,
   syncStatus,
+  matchStatus,
+  isMatched,
   onSendSyncCommand,
   onSyncStatusChange,
+  onOpenPicker,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -30,11 +57,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
 
-  // Ignore local events temporarily when applying remote command to prevent command feedback loop
+  // Suppress local event broadcasts when applying remote authoritative commands
   const isApplyingRemoteCommandRef = useRef<boolean>(false);
   const lastUserSeekTimestampRef = useRef<number>(0);
 
-  // Authoritative sync ticker loop
+  // Sync ticker loop
   useEffect(() => {
     if (!videoRef.current || !src) return;
 
@@ -42,53 +69,55 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       const video = videoRef.current;
       if (!video || video.readyState < 2) return;
 
-      const currentServerTime = getEstimatedServerTime();
-      const targetPos = calculateTargetPosition(playbackState, currentServerTime);
-      const localTime = video.currentTime;
+      // Only perform automatic authoritative drift correction if movies match
+      if (isMatched) {
+        const currentServerTime = getEstimatedServerTime();
+        const targetPos = calculateTargetPosition(playbackState, currentServerTime);
+        const localTime = video.currentTime;
+        const drift = calculateDrift(localTime, targetPos);
 
-      const drift = calculateDrift(localTime, targetPos);
+        // Hard seek if drift exceeds threshold
+        if (shouldHardSeek(drift, 1.5)) {
+          if (Date.now() - lastUserSeekTimestampRef.current > 1200) {
+            isApplyingRemoteCommandRef.current = true;
+            video.currentTime = targetPos;
+            onSyncStatusChange('correcting');
+            setTimeout(() => {
+              isApplyingRemoteCommandRef.current = false;
+            }, 400);
+          }
+        } else {
+          // Smooth micro-drift rate correction (0.9x to 1.1x)
+          const rateCorrection = calculateRateCorrection(drift);
+          if (Math.abs(video.playbackRate - rateCorrection) > 0.02) {
+            video.playbackRate = rateCorrection;
+          }
+          if (syncStatus !== 'synced' && syncStatus !== 'buffering') {
+            onSyncStatusChange('synced');
+          }
+        }
 
-      // Check if hard seek is required
-      if (shouldHardSeek(drift, 1.5)) {
-        if (Date.now() - lastUserSeekTimestampRef.current > 1000) {
+        // Synchronize remote play/pause state
+        if (playbackState.isPlaying && video.paused) {
           isApplyingRemoteCommandRef.current = true;
-          video.currentTime = targetPos;
-          onSyncStatusChange('correcting');
+          video.play().catch(() => {
+            setAutoplayBlocked(true);
+          });
+          setTimeout(() => {
+            isApplyingRemoteCommandRef.current = false;
+          }, 400);
+        } else if (!playbackState.isPlaying && !video.paused) {
+          isApplyingRemoteCommandRef.current = true;
+          video.pause();
           setTimeout(() => {
             isApplyingRemoteCommandRef.current = false;
           }, 400);
         }
-      } else {
-        // Micro-drift playback rate adjustment
-        const rateCorrection = calculateRateCorrection(drift);
-        if (Math.abs(video.playbackRate - rateCorrection) > 0.02) {
-          video.playbackRate = rateCorrection;
-        }
-        if (syncStatus !== 'synced' && syncStatus !== 'buffering') {
-          onSyncStatusChange('synced');
-        }
-      }
-
-      // Sync play/pause state
-      if (playbackState.isPlaying && video.paused) {
-        isApplyingRemoteCommandRef.current = true;
-        video.play().catch(() => {
-          setAutoplayBlocked(true);
-        });
-        setTimeout(() => {
-          isApplyingRemoteCommandRef.current = false;
-        }, 400);
-      } else if (!playbackState.isPlaying && !video.paused) {
-        isApplyingRemoteCommandRef.current = true;
-        video.pause();
-        setTimeout(() => {
-          isApplyingRemoteCommandRef.current = false;
-        }, 400);
       }
     }, 500);
 
     return () => clearInterval(interval);
-  }, [playbackState, src, syncStatus, onSyncStatusChange]);
+  }, [playbackState, src, isMatched, syncStatus, onSyncStatusChange]);
 
   // Handle local user Play/Pause toggle
   const handleTogglePlay = useCallback(() => {
@@ -98,17 +127,24 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     const currentPos = video.currentTime;
 
     if (video.paused) {
-      video.play().then(() => {
-        setAutoplayBlocked(false);
-        onSendSyncCommand('PLAY', currentPos);
-      }).catch(() => {
-        setAutoplayBlocked(true);
-      });
+      video
+        .play()
+        .then(() => {
+          setAutoplayBlocked(false);
+          if (isMatched) {
+            onSendSyncCommand('PLAY', currentPos);
+          }
+        })
+        .catch(() => {
+          setAutoplayBlocked(true);
+        });
     } else {
       video.pause();
-      onSendSyncCommand('PAUSE', currentPos);
+      if (isMatched) {
+        onSendSyncCommand('PAUSE', currentPos);
+      }
     }
-  }, [src, onSendSyncCommand]);
+  }, [src, isMatched, onSendSyncCommand]);
 
   // Handle local Seek
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -119,7 +155,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     videoRef.current.currentTime = targetPos;
     setCurrentTime(targetPos);
 
-    onSendSyncCommand('SEEK', targetPos);
+    if (isMatched) {
+      onSendSyncCommand('SEEK', targetPos);
+    }
   };
 
   // Handle Volume
@@ -172,6 +210,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
   const handlePlaying = () => {
     setIsPlaying(true);
+    setAutoplayBlocked(false);
     onSyncStatusChange('synced');
   };
 
@@ -180,8 +219,33 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   };
 
   const handleError = () => {
-    setPlaybackError('Failed to load video file. Please ensure it is a valid MP4 or WebM video.');
+    const video = videoRef.current;
+    let message = 'Unable to decode this video file in browser.';
+    if (video?.error) {
+      switch (video.error.code) {
+        case 1:
+          message = 'Video playback aborted.';
+          break;
+        case 2:
+          message = 'Network error while loading video.';
+          break;
+        case 3:
+          message = 'Video decoding failed or codec unsupported.';
+          break;
+        case 4:
+          message = 'Format or codec not supported. MP4 with H.264 video and AAC audio is recommended.';
+          break;
+      }
+    }
+    setPlaybackError(message);
     onSyncStatusChange('desynced');
+  };
+
+  const handleRetryPlayback = () => {
+    setPlaybackError(null);
+    if (videoRef.current && src) {
+      videoRef.current.load();
+    }
   };
 
   const formatTime = (seconds: number): string => {
@@ -200,7 +264,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   return (
     <div
       ref={containerRef}
-      className="relative w-full aspect-video bg-black rounded-2xl overflow-hidden shadow-2xl border border-slate-800 flex flex-col justify-center items-center group"
+      className="relative w-full aspect-video bg-black rounded-2xl overflow-hidden shadow-2xl border border-slate-800 flex flex-col justify-center items-center group select-none"
     >
       {/* Video Element */}
       {src ? (
@@ -220,12 +284,20 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       ) : (
         <div className="flex flex-col items-center justify-center p-6 text-center space-y-3">
           <div className="w-16 h-16 rounded-full bg-slate-900/80 border border-slate-800 flex items-center justify-center text-slate-500">
-            <Play className="w-8 h-8 ml-1" />
+            <Film className="w-8 h-8" />
           </div>
-          <p className="text-slate-300 text-sm sm:text-base font-medium">No Local Movie Selected</p>
-          <p className="text-slate-500 text-xs max-w-sm">
-            Select or download a matching movie file below to begin synchronized playback.
+          <p className="text-slate-200 text-sm sm:text-base font-semibold">No Local Movie Selected</p>
+          <p className="text-slate-400 text-xs max-w-sm">
+            Select a movie file from your laptop or tablet below to begin.
           </p>
+          {onOpenPicker && (
+            <button
+              onClick={onOpenPicker}
+              className="mt-2 bg-gradient-to-r from-rose-600 to-violet-600 hover:from-rose-500 hover:to-violet-500 text-white text-xs font-semibold px-4 py-2 rounded-xl shadow-lg transition cursor-pointer"
+            >
+              Choose Movie File
+            </button>
+          )}
         </div>
       )}
 
@@ -233,42 +305,66 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       <div className="absolute top-3 left-3 z-20 flex items-center space-x-2">
         <div
           className={`flex items-center space-x-1.5 px-3 py-1 rounded-full text-xs font-semibold backdrop-blur-md border ${
-            syncStatus === 'synced'
+            isMatched && syncStatus === 'synced'
               ? 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300'
               : syncStatus === 'correcting' || syncStatus === 'buffering'
               ? 'bg-amber-950/70 border-amber-500/40 text-amber-300'
-              : 'bg-rose-950/70 border-rose-500/40 text-rose-300'
+              : 'bg-slate-900/80 border-slate-700/80 text-slate-300'
           }`}
         >
-          {syncStatus === 'synced' && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />}
+          {isMatched && syncStatus === 'synced' && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />}
           {(syncStatus === 'correcting' || syncStatus === 'buffering') && (
             <RefreshCw className="w-3.5 h-3.5 text-amber-400 animate-spin" />
           )}
-          {syncStatus === 'desynced' && <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />}
-          <span className="capitalize">{syncStatus.replace('_', ' ')}</span>
+          {matchStatus === 'movies_mismatch' && <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />}
+          <span>
+            {matchStatus === 'movies_mismatch'
+              ? 'Files Mismatched'
+              : isMatched
+              ? 'Synced & Ready'
+              : 'Waiting for Matching Movie'}
+          </span>
         </div>
       </div>
 
       {/* Autoplay Blocked User Interaction Overlay */}
       {autoplayBlocked && (
-        <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm z-30 flex flex-col items-center justify-center p-4">
-          <p className="text-slate-200 text-sm font-medium mb-3">Browser prevented automatic playback</p>
+        <div className="absolute inset-0 bg-slate-950/85 backdrop-blur-sm z-30 flex flex-col items-center justify-center p-4">
+          <p className="text-slate-200 text-sm font-semibold mb-3">Browser prevented automatic playback</p>
           <button
             onClick={handleTogglePlay}
-            className="flex items-center space-x-2 bg-rose-600 hover:bg-rose-500 text-white px-5 py-2.5 rounded-xl font-medium shadow-lg transition touch-control cursor-pointer"
+            className="flex items-center space-x-2 bg-gradient-to-r from-rose-600 to-violet-600 hover:from-rose-500 hover:to-violet-500 text-white px-6 py-3 rounded-xl font-semibold shadow-xl transition touch-control cursor-pointer transform hover:scale-105"
           >
             <Play className="w-5 h-5 fill-current" />
-            <span>Tap to Resume Playback</span>
+            <span>Tap to Start Watching</span>
           </button>
         </div>
       )}
 
       {/* Playback Error Overlay */}
       {playbackError && (
-        <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md z-30 flex flex-col items-center justify-center p-6 text-center">
-          <AlertTriangle className="w-10 h-10 text-rose-500 mb-2" />
-          <p className="text-slate-200 font-semibold text-sm sm:text-base mb-1">Playback Error</p>
-          <p className="text-rose-400 text-xs sm:text-sm max-w-md">{playbackError}</p>
+        <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md z-30 flex flex-col items-center justify-center p-6 text-center space-y-3">
+          <AlertTriangle className="w-10 h-10 text-rose-500" />
+          <div>
+            <p className="text-slate-100 font-semibold text-sm sm:text-base">Playback Error</p>
+            <p className="text-rose-300 text-xs sm:text-sm max-w-md mt-1">{playbackError}</p>
+          </div>
+          <div className="flex items-center space-x-3 pt-2">
+            <button
+              onClick={handleRetryPlayback}
+              className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold px-4 py-2 rounded-xl transition cursor-pointer"
+            >
+              Retry
+            </button>
+            {onOpenPicker && (
+              <button
+                onClick={onOpenPicker}
+                className="bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold px-4 py-2 rounded-xl transition cursor-pointer"
+              >
+                Choose Another Video
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -302,16 +398,18 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 {isPlaying ? <Pause className="w-5 h-5 fill-current" /> : <Play className="w-5 h-5 fill-current" />}
               </button>
 
-              <button
-                onClick={() => {
-                  const targetPos = calculateTargetPosition(playbackState, getEstimatedServerTime());
-                  if (videoRef.current) videoRef.current.currentTime = targetPos;
-                }}
-                className="p-2 text-slate-400 hover:text-violet-300 hover:bg-slate-800/60 rounded-xl transition touch-control cursor-pointer"
-                title="Force Re-sync with Host"
-              >
-                <RotateCcw className="w-4 h-4" />
-              </button>
+              {isMatched && (
+                <button
+                  onClick={() => {
+                    const targetPos = calculateTargetPosition(playbackState, getEstimatedServerTime());
+                    if (videoRef.current) videoRef.current.currentTime = targetPos;
+                  }}
+                  className="p-2 text-slate-400 hover:text-violet-300 hover:bg-slate-800/60 rounded-xl transition touch-control cursor-pointer"
+                  title="Force Re-sync with Partner"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                </button>
+              )}
             </div>
 
             {/* Volume & Fullscreen */}

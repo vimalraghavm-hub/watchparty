@@ -32,7 +32,7 @@ export const MovieUploader: React.FC<MovieUploaderProps> = ({
     if (!file) return;
 
     setError(null);
-    const val = validateMovieFile(file, 500);
+    const val = validateMovieFile(file);
     if (!val.valid) {
       setError(val.error || 'Invalid file size or format.');
       return;

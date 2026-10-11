@@ -17,6 +17,14 @@ Object.defineProperty(HTMLMediaElement.prototype, 'load', {
   value: vi.fn(),
 });
 
+// Mock URL.createObjectURL and URL.revokeObjectURL
+if (typeof URL.createObjectURL !== 'function') {
+  URL.createObjectURL = vi.fn((blob: Blob) => `blob:mock-${(blob as File).name || 'file'}`);
+}
+if (typeof URL.revokeObjectURL !== 'function') {
+  URL.revokeObjectURL = vi.fn();
+}
+
 // Mock crypto.randomUUID
 if (!globalThis.crypto) {
   // @ts-expect-error Mocking crypto in test env

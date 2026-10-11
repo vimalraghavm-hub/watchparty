@@ -1,6 +1,6 @@
 /**
- * Security utilities for WatchTogether
- * Handles cryptographic tokens, full-file hashing, authorization checks, and sanitization.
+ * Security & File Verification utilities for WatchTogether
+ * Handles cryptographic tokens, full-file hashing, format validation, and sanitization.
  */
 
 // Generate a cryptographically secure, unpredictable invitation token
@@ -43,8 +43,9 @@ export function setGuestName(name: string): void {
 }
 
 /**
- * Calculate full-file SHA-256 cryptographic identity hash.
- * Reads the ENTIRE file in sequential chunks to guarantee 100% full file identity without memory overflow.
+ * Calculate deterministic full-file SHA-256 cryptographic identity hash.
+ * Slices the file in 16MB chunks to stream 100% of all file bytes into cryptographic digests
+ * without holding large gigabyte files in JavaScript heap memory.
  */
 export async function calculateFileHash(
   file: File,
@@ -52,10 +53,11 @@ export async function calculateFileHash(
 ): Promise<string> {
   if (!file) return '';
 
-  // Direct single-pass buffer hash for files <= 200MB
-  const SINGLE_PASS_LIMIT = 200 * 1024 * 1024;
+  const CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB chunks
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-  if (file.size <= SINGLE_PASS_LIMIT && window.crypto && window.crypto.subtle) {
+  // For small files (<= 16MB), compute single pass SHA-256 directly
+  if (totalChunks <= 1 && window.crypto && window.crypto.subtle) {
     try {
       const buffer = await file.arrayBuffer();
       if (progressCallback) progressCallback(50);
@@ -64,20 +66,34 @@ export async function calculateFileHash(
       const hashArray = Array.from(new Uint8Array(hashBuffer));
       return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
     } catch {
-      // Fall through to chunked approach if arrayBuffer fails
+      // Fall through to chunked loop if arrayBuffer fails
     }
   }
 
-  // Sequential full-file chunked SHA-256 hash calculation (processes 100% of file bytes)
-  const CHUNK_SIZE = 16 * 1024 * 1024; // 16 MB chunks
-  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+async function readBlobAsArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
+  if (typeof blob.arrayBuffer === 'function') {
+    try {
+      return await blob.arrayBuffer();
+    } catch {
+      // Fallback to FileReader
+    }
+  }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as ArrayBuffer);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsArrayBuffer(blob);
+  });
+}
+
+  // Multi-chunk sequential hashing for larger files (processes 100% of bytes)
   const chunkHashes: string[] = [];
 
   for (let i = 0; i < totalChunks; i++) {
     const start = i * CHUNK_SIZE;
     const end = Math.min(file.size, start + CHUNK_SIZE);
     const slice = file.slice(start, end);
-    const buffer = await slice.arrayBuffer();
+    const buffer = await readBlobAsArrayBuffer(slice);
 
     if (window.crypto && window.crypto.subtle) {
       const hashBuffer = await window.crypto.subtle.digest('SHA-256', buffer);
@@ -92,9 +108,9 @@ export async function calculateFileHash(
     }
   }
 
-  // Combine all chunk SHA-256 hashes into a final master SHA-256 hash
+  // Combine chunk hashes with total file byte size into final composite master hash
   const encoder = new TextEncoder();
-  const masterBuffer = encoder.encode(chunkHashes.join(':'));
+  const masterBuffer = encoder.encode(`${file.size}:${chunkHashes.join(':')}`);
 
   if (window.crypto && window.crypto.subtle) {
     const finalHashBuffer = await window.crypto.subtle.digest('SHA-256', masterBuffer);
@@ -105,38 +121,39 @@ export async function calculateFileHash(
   return `chunked_${file.size}_${chunkHashes.length}`;
 }
 
-// Validate file type & size for private movie upload
+// Validate file type for private local movie playback
 export interface FileValidationResult {
   valid: boolean;
   error?: string;
   recommendedAction?: string;
 }
 
-export function validateMovieFile(file: File, maxMb = 500): FileValidationResult {
+export function validateMovieFile(file: File): FileValidationResult {
   if (!file) {
     return { valid: false, error: 'No file selected.' };
   }
 
-  const maxBytes = maxMb * 1024 * 1024;
-  if (file.size > maxBytes) {
-    return {
-      valid: false,
-      error: `File size (${(file.size / (1024 * 1024)).toFixed(1)} MB) exceeds private storage quota of ${maxMb} MB.`,
-      recommendedAction: 'You can still select this local movie file on both devices for direct synchronized watching without uploading!',
-    };
-  }
-
-  const validTypes = ['video/mp4', 'video/webm', 'video/ogg', 'video/mkv', 'video/x-matroska', 'video/quicktime'];
+  const validTypes = [
+    'video/mp4',
+    'video/webm',
+    'video/ogg',
+    'video/mkv',
+    'video/x-matroska',
+    'video/quicktime',
+  ];
   const validExtensions = ['.mp4', '.webm', '.mkv', '.mov', '.ogg'];
 
   const extension = '.' + file.name.split('.').pop()?.toLowerCase();
-  const isValidType = validTypes.includes(file.type.toLowerCase()) || validExtensions.includes(extension);
+  const isValidType =
+    validTypes.includes(file.type.toLowerCase()) ||
+    validExtensions.includes(extension) ||
+    file.type.startsWith('video/');
 
   if (!isValidType) {
     return {
       valid: false,
-      error: `Unsupported file format: ${file.name}. Standard MP4 (H.264 video + AAC audio) or WebM is recommended.`,
-      recommendedAction: 'Please select an MP4 (.mp4) or WebM (.webm) video file.',
+      error: `Unsupported file format: "${file.name}".`,
+      recommendedAction: 'Please select a standard MP4 (.mp4) or WebM (.webm) video file.',
     };
   }
 
